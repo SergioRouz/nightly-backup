@@ -1,0 +1,101 @@
+# Ночной бэкап БД: pg_dump → шифрование AES-256 → Cloudflare R2.
+# Живёт в отдельном ПУБЛИЧНОМ репо: у публичных репозиториев GitHub Actions
+# бесплатны без лимита минут, поэтому бэкап не зависит от квоты основного репо.
+# Retention: 14 суточных + 8 недельных (вс). RPO <= 24 ч.
+# Восстановление репетируется workflow'ом restore-test.yml (раз в месяц).
+#
+# Секреты: SUPABASE_DB_URL (session pooler, IPv4!), BACKUP_PASSPHRASE,
+#          R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BACKUP_BUCKET
+name: Nightly DB backup
+
+on:
+  schedule:
+    - cron: '23 2 * * *' # каждую ночь 02:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write # heartbeat-коммит (см. последний шаг)
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dump database (pg_dump via postgres:17 image)
+        run: |
+          docker run --rm --network host -v "$PWD:/backup" postgres:17 \
+            pg_dump "${{ secrets.SUPABASE_DB_URL }}" \
+            --format=custom --no-owner --no-privileges \
+            --file=/backup/db.dump
+          # репо публичный — размер дампа в лог не печатаем
+          test -s db.dump && echo "dump: OK"
+
+      - name: Encrypt (AES-256, PBKDF2)
+        run: |
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+            -pass env:BACKUP_PASSPHRASE \
+            -in db.dump -out db.dump.enc
+          rm db.dump
+        env:
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+
+      - name: Upload to R2 + retention
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          # .eu — у корзины EU-юрисдикция (DSGVO), у неё отдельный S3-endpoint
+          ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.eu.r2.cloudflarestorage.com
+          BUCKET: ${{ secrets.R2_BACKUP_BUCKET }}
+        run: |
+          set -euo pipefail
+          STAMP=$(date -u +%Y-%m-%d)
+          DOW=$(date -u +%u)  # 7 = воскресенье
+
+          aws s3 cp db.dump.enc "s3://$BUCKET/daily/readbird-$STAMP.dump.enc" --endpoint-url "$ENDPOINT"
+          if [ "$DOW" = "7" ]; then
+            aws s3 cp db.dump.enc "s3://$BUCKET/weekly/readbird-$STAMP.dump.enc" --endpoint-url "$ENDPOINT"
+          fi
+
+          # Retention: daily старше 14 дней, weekly старше 8 недель — удалить
+          prune() {
+            local prefix=$1 cutoff=$2
+            # `aws s3 ls` возвращает код 1 на пустом префиксе — это не ошибка
+            (aws s3 ls "s3://$BUCKET/$prefix/" --endpoint-url "$ENDPOINT" || true) | awk '{print $4}' | while read -r key; do
+              [ -z "$key" ] && continue
+              fdate=$(echo "$key" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' || true)
+              [ -z "$fdate" ] && continue
+              if [ "$(date -u -d "$fdate" +%s)" -lt "$cutoff" ]; then
+                echo "prune: $prefix/$key"
+                aws s3 rm "s3://$BUCKET/$prefix/$key" --endpoint-url "$ENDPOINT"
+              fi
+            done
+          }
+          prune daily  "$(date -u -d '14 days ago' +%s)"
+          prune weekly "$(date -u -d '56 days ago' +%s)"
+
+      - name: Verify upload
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          # только даты и имена файлов, без размеров (публичный лог)
+          aws s3 ls "s3://${{ secrets.R2_BACKUP_BUCKET }}/daily/" \
+            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.eu.r2.cloudflarestorage.com" \
+            | awk '{print $1, $4}' | tail -n 3
+
+      - name: Heartbeat commit (по воскресеньям)
+        # GitHub отключает расписание в репо без активности 60 дней —
+        # еженедельный коммит держит репо «живым», иначе бэкапы молча встанут.
+        run: |
+          [ "$(date -u +%u)" = "7" ] || { echo "не воскресенье — пропуск"; exit 0; }
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          date -u +%Y-%m-%d > .heartbeat
+          git add .heartbeat
+          git commit -m "heartbeat $(date -u +%F)" || exit 0
+          git push
