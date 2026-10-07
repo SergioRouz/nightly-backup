@@ -1,0 +1,65 @@
+# Ночная копия медиа пользователей из R2 `readbird-content` в `readbird-media-backup` (аудит ops-2026-10 В2).
+# Фото заметок, фоны Flow и значки папок не переизвлекаются (в отличие от текстов статей), копии у них не было.
+# Копируем ТОЛЬКО эти префиксы (тексты статей и ленты не нужны): note-media/, flow-media/, flow-bg/, folder-icon/.
+# Защита: у бакета копии bucket lock 35 суток (нельзя стереть/перезаписать) + удаление через 36 суток —
+# политика приватности обещает «нигде дольше 8 недель» (ключи объектов — UUID, не меняются, поэтому копируем только новые).
+# Токены раздельные: источник — только чтение (MEDIA_SRC_*), копия — чтение/запись только в свой бакет (MEDIA_DST_*).
+# Репо публичный: имена и размеры в лог не печатаем, только число файлов и OK.
+name: Media backup
+
+on:
+  schedule:
+    - cron: '47 3 * * *' # ежесуточно 03:47 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  copy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_DEFAULT_REGION: auto
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.eu.r2.cloudflarestorage.com
+      SRC_BUCKET: readbird-content
+      DST_BUCKET: readbird-media-backup
+    steps:
+      - name: Pull media prefixes from source (read-only token)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.MEDIA_SRC_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.MEDIA_SRC_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir media
+          for p in note-media flow-media flow-bg folder-icon; do
+            aws s3 sync "s3://$SRC_BUCKET/$p/" "media/$p/" --endpoint-url "$ENDPOINT" --only-show-errors
+          done
+          echo "pulled files: $(find media -type f | wc -l)"
+
+      - name: Push to backup bucket (write token, locked bucket)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.MEDIA_DST_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.MEDIA_DST_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          # sync без --delete: удаления в источнике в копию не переносим (замок их и не пустит);
+          # уже существующие ключи пропускаются по размеру/дате.
+          for p in note-media flow-media flow-bg folder-icon; do
+            [ -d "media/$p" ] || continue
+            aws s3 sync "media/$p/" "s3://$DST_BUCKET/$p/" --endpoint-url "$ENDPOINT" --only-show-errors
+          done
+
+      - name: Verify every source file is in the copy
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.MEDIA_DST_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.MEDIA_DST_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          LOCAL=$(find media -type f | sed 's|^media/||' | sort)
+          REMOTE=$(for p in note-media flow-media flow-bg folder-icon; do (aws s3 ls "s3://$DST_BUCKET/$p/" --recursive --endpoint-url "$ENDPOINT" || true) | awk '{print $4}'; done | sort)
+          MISSING=$(comm -23 <(echo "$LOCAL") <(echo "$REMOTE") | grep -c . || true)
+          echo "files in source: $(echo "$LOCAL" | grep -c . || true); missing in copy: $MISSING"
+          if [ "$MISSING" != "0" ]; then echo "::error::Не все файлы источника попали в копию"; exit 1; fi
+          echo "MEDIA BACKUP: OK"
