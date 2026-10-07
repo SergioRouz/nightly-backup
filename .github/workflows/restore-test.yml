@@ -72,6 +72,11 @@ jobs:
       - name: Restore into clean Postgres 17
         run: |
           # Ролей и функций auth.* в чистом Postgres нет — без них не выдать права. Таблицу auth.users НЕ заглушаем: её восстанавливает сам дамп (проверка ниже).
+          # Репо публичный (аудит ops-2026-10 М5): сервер не должен писать в лог тексты упавших запросов и имена
+          # объектов — иначе при первой же ошибке pg_restore схема и политики утекут в открытый лог контейнера.
+          docker run --rm --network host postgres:17 \
+            psql "postgresql://postgres:restoretest@localhost:5432/postgres" -v ON_ERROR_STOP=1 -q \
+            -c "alter system set log_min_messages = 'fatal';" -c "alter system set log_min_error_statement = 'panic';" -c "select pg_reload_conf();" > /dev/null
           docker run --rm --network host postgres:17 \
             psql "postgresql://postgres:restoretest@localhost:5432/postgres" -v ON_ERROR_STOP=1 -c \
             "create role anon nologin; create role authenticated nologin; create role service_role nologin bypassrls; create schema auth; create function auth.uid() returns uuid language sql stable as 'select null::uuid'; create function auth.role() returns text language sql stable as 'select null::text'; create function auth.jwt() returns jsonb language sql stable as 'select null::jsonb';"
