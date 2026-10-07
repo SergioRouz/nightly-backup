@@ -1,6 +1,8 @@
-# Репетиция восстановления (RTO <= 4 ч): скачивает свежайший бэкап из R2,
-# расшифровывает, восстанавливает в чистый Postgres 17 и проверяет, что
-# ключевые таблицы И АККАУНТЫ ПОЛЬЗОВАТЕЛЕЙ (auth.users) на месте.
+# Репетиция восстановления (RTO <= 4 ч): скачивает свежайший бэкап из R2, расшифровывает,
+# восстанавливает в чистый Postgres 17 и проверяет таблицы, аккаунты (auth.users) и ПРАВА
+# (явные GRANT из основного репо — аудит rls-2026-10 В2).
+# Живёт ЗДЕСЬ, а не в основном репо: ключи бэкапа не должны быть доступны пушам в `readbird` (аудит ops-2026-10 В7).
+# Репо публичный — имён таблиц и счётчиков в лог не печатаем, только OK/провал.
 # Запуск: вручную (workflow_dispatch) + раз в месяц по расписанию.
 name: Backup restore rehearsal
 
@@ -8,6 +10,9 @@ on:
   schedule:
     - cron: '41 3 1 * *' # 1-го числа каждого месяца
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   restore:
@@ -20,9 +25,20 @@ jobs:
         ports: ['5432:5432']
         options: >-
           --health-cmd "pg_isready -U postgres"
-          --health-interval 5s --health-timeout 5s --health-retries 10
+          --health-interval 5s --health-retries 10 --health-timeout 5s
     steps:
-      - name: Download latest daily backup from R2
+      # Файл с правами лежит в приватном основном репо: читаем его токеном «только чтение» (секрет READBIRD_READ_TOKEN).
+      - name: Fetch explicit grants (private repo, read-only token)
+        uses: actions/checkout@v4
+        with:
+          repository: SergioRouz/readbird
+          token: ${{ secrets.READBIRD_READ_TOKEN }}
+          ref: main
+          path: readbird
+          sparse-checkout: backend/supabase/migrations/20261008130000_explicit_grants.sql
+          sparse-checkout-cone-mode: false
+
+      - name: Download latest daily backup from R2 (must be fresh)
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -36,6 +52,12 @@ jobs:
           LATEST=$(aws s3 ls "s3://$BUCKET/daily/" --endpoint-url "$ENDPOINT" | awk '{print $4}' | sort | tail -n 1)
           echo "Latest backup: $LATEST"
           test -n "$LATEST"
+          # Свежесть (аудит ops-2026-10 В4): дата в имени файла не старше 2 суток, иначе репетиция
+          # молча восстановила бы дамп двухнедельной давности и написала OK.
+          FDATE=$(echo "$LATEST" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}')
+          AGE=$(( ( $(date -u +%s) - $(date -u -d "$FDATE" +%s) ) / 86400 ))
+          echo "Backup age: $AGE d"
+          if [ "$AGE" -gt 2 ]; then echo "::error::Последний бэкап старше 2 суток — ночной бэкап не работает"; exit 1; fi
           aws s3 cp "s3://$BUCKET/daily/$LATEST" db.dump.enc --endpoint-url "$ENDPOINT"
 
       - name: Decrypt
@@ -49,21 +71,41 @@ jobs:
 
       - name: Restore into clean Postgres 17
         run: |
+          # Ролей и заглушек Supabase в чистом Postgres нет — без них не выдать права.
+          docker run --rm --network host postgres:17 \
+            psql "postgresql://postgres:restoretest@localhost:5432/postgres" -v ON_ERROR_STOP=1 -c \
+            "create role anon nologin; create role authenticated nologin; create role service_role nologin bypassrls; create schema auth; create table auth.users (id uuid primary key); create function auth.uid() returns uuid language sql stable as 'select null::uuid'; create function auth.role() returns text language sql stable as 'select null::text'; create function auth.jwt() returns jsonb language sql stable as 'select null::jsonb';"
           docker run --rm --network host -v "$PWD:/backup" postgres:17 \
             pg_restore --no-owner --no-privileges \
             --dbname "postgresql://postgres:restoretest@localhost:5432/postgres" \
-            /backup/db.dump || true
-          # pg_restore может ругаться на отсутствующие роли Supabase — это ок;
-          # критерий ниже: таблицы, данные И аккаунты восстановлены.
+            /backup/db.dump > /dev/null 2>&1 || true
+          # pg_restore ругается на объекты Supabase — это ок; критерий — проверки ниже.
+
+      - name: Apply explicit grants (dump is made with --no-privileges)
+        run: |
+          docker run --rm --network host -v "$PWD/readbird:/repo" postgres:17 \
+            psql "postgresql://postgres:restoretest@localhost:5432/postgres" -v ON_ERROR_STOP=1 -q \
+            -f /repo/backend/supabase/migrations/20261008130000_explicit_grants.sql > /dev/null
+          echo "grants applied: OK"
+
+      - name: Recompute account byte budgets (triggers do not fire on pg_restore)
+        run: |
+          docker run --rm --network host postgres:17 \
+            psql "postgresql://postgres:restoretest@localhost:5432/postgres" -v ON_ERROR_STOP=1 -q -c \
+            "do \$\$ begin if to_regproc('public.rb_user_db_usage_recompute') is not null then perform public.rb_user_db_usage_recompute(); end if; end \$\$;" > /dev/null
+          echo "budgets recompute: OK"
 
       - name: Sanity check
-        # Репо публичный — счётчики в лог не печатаем, только OK/провал.
         run: |
           q() { docker run --rm --network host postgres:17 \
-            psql "postgresql://postgres:restoretest@localhost:5432/postgres" -tAc "$1"; }
-          TABLES=$(q "select count(*) from information_schema.tables where table_schema = 'public';" | tr -d '[:space:]')
-          test "$TABLES" -ge 20 && echo "public tables: OK"
-          USERS=$(q "select count(*) from auth.users;" | tr -d '[:space:]')
-          test "$USERS" -ge 2 && echo "auth.users: OK (аккаунты восстановимы)"
-          q "select id from public.keepalive limit 1;" >/dev/null && echo "data readable: OK"
+            psql "postgresql://postgres:restoretest@localhost:5432/postgres" -tAc "$1" | tr -d '[:space:]'; }
+          ok() { if [ "$1" = "1" ]; then echo "$2: OK"; else echo "::error::$2: ПРОВАЛ"; exit 1; fi; }
+          [ "$(q "select count(*) from information_schema.tables where table_schema = 'public';")" -ge 20 ] && ok 1 "public tables" || ok 0 "public tables"
+          [ "$(q "select count(*) from auth.users;")" -ge 2 ] && ok 1 "auth.users (аккаунты восстановимы)" || ok 0 "auth.users"
+          [ -n "$(q "select id from public.keepalive limit 1;")" ] && ok 1 "data readable" || ok 0 "data readable"
+          [ "$(q "select has_table_privilege('authenticated','public.notes','select') and has_table_privilege('service_role','public.entries','insert') and not has_table_privilege('anon','public.notes','select');")" = "t" ] && ok 1 "grants check" || ok 0 "grants check"
+          # Таблица с политикой для authenticated, но без прав = её нет в explicit_grants.sql (имена в публичный лог не печатаем).
+          UNCOVERED=$(q "select count(distinct c.relname) from pg_policies p join pg_class c on c.relnamespace = 'public'::regnamespace and c.relname = p.tablename where p.schemaname = 'public' and ('authenticated' = any(p.roles) or 'public' = any(p.roles)) and not (has_any_column_privilege('authenticated', c.oid, 'select,insert,update') or has_table_privilege('authenticated', c.oid, 'delete'));")
+          if [ "$UNCOVERED" != "0" ]; then echo "::error::Таблиц с политиками, но без прав: $UNCOVERED (допиши в explicit_grants.sql основного репо)"; exit 1; fi
+          echo "tables without grants: 0 — OK"
           echo "RESTORE REHEARSAL: OK"
