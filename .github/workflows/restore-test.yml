@@ -71,10 +71,10 @@ jobs:
 
       - name: Restore into clean Postgres 17
         run: |
-          # Ролей и заглушек Supabase в чистом Postgres нет — без них не выдать права.
+          # Ролей и функций auth.* в чистом Postgres нет — без них не выдать права. Таблицу auth.users НЕ заглушаем: её восстанавливает сам дамп (проверка ниже).
           docker run --rm --network host postgres:17 \
             psql "postgresql://postgres:restoretest@localhost:5432/postgres" -v ON_ERROR_STOP=1 -c \
-            "create role anon nologin; create role authenticated nologin; create role service_role nologin bypassrls; create schema auth; create table auth.users (id uuid primary key); create function auth.uid() returns uuid language sql stable as 'select null::uuid'; create function auth.role() returns text language sql stable as 'select null::text'; create function auth.jwt() returns jsonb language sql stable as 'select null::jsonb';"
+            "create role anon nologin; create role authenticated nologin; create role service_role nologin bypassrls; create schema auth; create function auth.uid() returns uuid language sql stable as 'select null::uuid'; create function auth.role() returns text language sql stable as 'select null::text'; create function auth.jwt() returns jsonb language sql stable as 'select null::jsonb';"
           docker run --rm --network host -v "$PWD:/backup" postgres:17 \
             pg_restore --no-owner --no-privileges \
             --dbname "postgresql://postgres:restoretest@localhost:5432/postgres" \
