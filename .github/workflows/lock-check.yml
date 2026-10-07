@@ -24,7 +24,7 @@ jobs:
           ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.eu.r2.cloudflarestorage.com
           BUCKET: ${{ secrets.R2_BACKUP_BUCKET }}
         run: |
-          set -uo pipefail
+          set +e; set -uo pipefail  # отказ в удалении — ожидаемый исход, шаг не должен падать на нём
           KEY=$(aws s3 ls "s3://$BUCKET/manual/" --endpoint-url "$ENDPOINT" | awk '{print $4}' | sort | tail -n 1)
           if [ -z "$KEY" ]; then echo "::error::В manual/ нет файлов — сначала запусти backup.yml вручную"; exit 1; fi
           OUT=$(aws s3api delete-object --bucket "$BUCKET" --key "manual/$KEY" --endpoint-url "$ENDPOINT" 2>&1)
