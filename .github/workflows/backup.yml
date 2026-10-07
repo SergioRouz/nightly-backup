@@ -1,7 +1,8 @@
 # Ночной бэкап БД: pg_dump → шифрование AES-256 → Cloudflare R2.
 # Живёт в отдельном ПУБЛИЧНОМ репо: у публичных репозиториев GitHub Actions
 # бесплатны без лимита минут, поэтому бэкап не зависит от квоты основного репо.
-# Retention: 14 суточных + 8 недельных (вс). RPO <= 24 ч.
+# Retention: 14 суточных + 8 недельных (вс) + ручные 14 суток (manual/). RPO <= 24 ч.
+# Бакет под замком: daily/ и manual/ — 13 суток, weekly/ — 55 суток (стереть/перезаписать раньше нельзя).
 # Восстановление репетируется workflow'ом restore-test.yml (раз в месяц).
 #
 # Секреты: SUPABASE_DB_URL (session pooler, IPv4!), BACKUP_PASSPHRASE,
@@ -50,14 +51,28 @@ jobs:
           # .eu — у корзины EU-юрисдикция (DSGVO), у неё отдельный S3-endpoint
           ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.eu.r2.cloudflarestorage.com
           BUCKET: ${{ secrets.R2_BACKUP_BUCKET }}
+          EVENT: ${{ github.event_name }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           STAMP=$(date -u +%Y-%m-%d)
           DOW=$(date -u +%u)  # 7 = воскресенье
 
-          aws s3 cp db.dump.enc "s3://$BUCKET/daily/readbird-$STAMP.dump.enc" --endpoint-url "$ENDPOINT"
-          if [ "$DOW" = "7" ]; then
-            aws s3 cp db.dump.enc "s3://$BUCKET/weekly/readbird-$STAMP.dump.enc" --endpoint-url "$ENDPOINT"
+          # Бакет под замком (bucket lock, аудит ops-2026-10 В3): существующий файл нельзя перезаписать.
+          # Поэтому в daily/ и weekly/ пишет только запуск по расписанию и только если файла за эту дату ещё нет;
+          # ручной запуск (и повтор в те же сутки) кладёт дамп в manual/ под уникальным именем (М6: дамп «до
+          # миграции» больше не затирается следующим запуском).
+          exists() { aws s3api head-object --bucket "$BUCKET" --key "$1" --endpoint-url "$ENDPOINT" > /dev/null 2>&1; }
+          DAILY="daily/readbird-$STAMP.dump.enc"
+          WEEKLY="weekly/readbird-$STAMP.dump.enc"
+          if [ "$EVENT" = "schedule" ] && ! exists "$DAILY"; then
+            aws s3 cp db.dump.enc "s3://$BUCKET/$DAILY" --endpoint-url "$ENDPOINT"
+            if [ "$DOW" = "7" ] && ! exists "$WEEKLY"; then
+              aws s3 cp db.dump.enc "s3://$BUCKET/$WEEKLY" --endpoint-url "$ENDPOINT"
+            fi
+          else
+            aws s3 cp db.dump.enc "s3://$BUCKET/manual/readbird-$(date -u +%Y-%m-%dT%H%M%S)-$RUN_ID.dump.enc" --endpoint-url "$ENDPOINT"
+            echo "manual/ : дамп сохранён под уникальным именем"
           fi
 
           # Retention: daily старше 14 дней, weekly старше 8 недель — удалить
@@ -70,12 +85,13 @@ jobs:
               [ -z "$fdate" ] && continue
               if [ "$(date -u -d "$fdate" +%s)" -lt "$cutoff" ]; then
                 echo "prune: $prefix/$key"
-                aws s3 rm "s3://$BUCKET/$prefix/$key" --endpoint-url "$ENDPOINT"
+                aws s3 rm "s3://$BUCKET/$prefix/$key" --endpoint-url "$ENDPOINT" || echo "prune: не удалён (ещё под замком?)"
               fi
             done
           }
           prune daily  "$(date -u -d '14 days ago' +%s)"
           prune weekly "$(date -u -d '56 days ago' +%s)"
+          prune manual "$(date -u -d '14 days ago' +%s)"
 
       - name: Verify upload
         env:
