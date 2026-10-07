@@ -26,6 +26,23 @@ jobs:
       SRC_BUCKET: readbird-content
       DST_BUCKET: readbird-media-backup
     steps:
+      # Access Key ID у R2 — 32 символа, Secret Access Key — 64. Частая ошибка — вставить «Token value» (другая длина).
+      # Печатаем только длины, не значения.
+      - name: Check secret shapes (lengths only)
+        env:
+          SRC_ID: ${{ secrets.MEDIA_SRC_ACCESS_KEY_ID }}
+          SRC_SECRET: ${{ secrets.MEDIA_SRC_SECRET_ACCESS_KEY }}
+          DST_ID: ${{ secrets.MEDIA_DST_ACCESS_KEY_ID }}
+          DST_SECRET: ${{ secrets.MEDIA_DST_SECRET_ACCESS_KEY }}
+        run: |
+          bad=0
+          chk() { if [ "${#2}" != "$3" ]; then echo "::error::$1: длина ${#2}, ожидалось $3"; bad=1; else echo "$1: длина OK"; fi; }
+          chk MEDIA_SRC_ACCESS_KEY_ID "$SRC_ID" 32
+          chk MEDIA_SRC_SECRET_ACCESS_KEY "$SRC_SECRET" 64
+          chk MEDIA_DST_ACCESS_KEY_ID "$DST_ID" 32
+          chk MEDIA_DST_SECRET_ACCESS_KEY "$DST_SECRET" 64
+          exit $bad
+
       - name: Pull media prefixes from source (read-only token)
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.MEDIA_SRC_ACCESS_KEY_ID }}
