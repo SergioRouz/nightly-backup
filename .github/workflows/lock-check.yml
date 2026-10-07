@@ -1,0 +1,37 @@
+# Свидетель bucket lock на бакете бэкапов (аудит ops-2026-10 В3): пробует УДАЛИТЬ свежайший файл из manual/
+# и считает успехом ОТКАЗ. Если удаление прошло — замок не работает, workflow падает.
+# Запуск только вручную (после правки правил замка в Cloudflare). В manual/ лежат ручные дампы — потеря одного
+# при неработающем замке не страшна, суточные (daily/) проверка не трогает.
+name: Backup lock check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete of a locked object must be refused
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.eu.r2.cloudflarestorage.com
+          BUCKET: ${{ secrets.R2_BACKUP_BUCKET }}
+        run: |
+          set -uo pipefail
+          KEY=$(aws s3 ls "s3://$BUCKET/manual/" --endpoint-url "$ENDPOINT" | awk '{print $4}' | sort | tail -n 1)
+          if [ -z "$KEY" ]; then echo "::error::В manual/ нет файлов — сначала запусти backup.yml вручную"; exit 1; fi
+          OUT=$(aws s3api delete-object --bucket "$BUCKET" --key "manual/$KEY" --endpoint-url "$ENDPOINT" 2>&1)
+          CODE=$?
+          STILL=$(aws s3 ls "s3://$BUCKET/manual/$KEY" --endpoint-url "$ENDPOINT" | wc -l)
+          echo "delete exit code: $CODE; object still present: $STILL"
+          echo "$OUT" | grep -oiE "AccessDenied|ObjectLocked|locked|retention|InvalidRequest|Forbidden" | sort -u | head -3 || true
+          if [ "$STILL" != "1" ]; then echo "::error::Файл удалён — bucket lock НЕ работает"; exit 1; fi
+          if [ "$CODE" = "0" ]; then echo "::error::Удаление не отклонено, хотя файл на месте — проверь вручную"; exit 1; fi
+          echo "LOCK CHECK: OK (удаление отклонено, файл на месте)"
